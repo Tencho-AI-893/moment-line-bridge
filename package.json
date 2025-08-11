@@ -1,0 +1,8 @@
+{
+  "name": "moment-line-bridge",
+  "type": "module",
+  "dependencies": {
+    "@line/bot-sdk": "^7.5.2",
+    "axios": "^1.7.0"
+  }
+}
