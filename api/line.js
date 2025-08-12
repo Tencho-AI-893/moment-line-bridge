@@ -1,8 +1,9 @@
-// Node 18 / Vercel Serverless Function
+// /api/line.js
+// Node 18 / Vercel Serverless
 import axios from 'axios';
 import { middleware, Client } from '@line/bot-sdk';
 
-export const config = { api: { bodyParser: false } }; // 署名検証に必要（生ボディ）
+export const config = { api: { bodyParser: false } };
 
 const lineConfig = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
@@ -12,68 +13,62 @@ const lineConfig = {
 const client = new Client(lineConfig);
 
 export default async function handler(req, res) {
-  // LINEミドルウェア（署名検証）
-  const mw = middleware(lineConfig);
-  try {
-    await new Promise((ok, ng) => mw(req, res, (e) => (e ? ng(e) : ok())));
-  } catch (e) {
-    console.error('LINE middleware error:', e?.message || e);
-    res.status(401).end('unauthorized');
-    return;
-  }
+  // ブラウザのGETは弾く（正常です）
+  if (req.method !== 'POST') return res.status(401).send('unauthorized');
 
-  const events = req.body?.events || [];
-  try {
-    await Promise.all(events.map(handleEvent));
-    res.status(200).end('ok');
-  } catch (e) {
-    console.error('handle events error:', e?.message || e);
-    res.status(500).end('error');
-  }
+  // 署名検証
+  await new Promise((ok, ng) =>
+    middleware(lineConfig)(req, res, (err) => (err ? ng(err) : ok()))
+  );
+
+  const events = req.body.events || [];
+  await Promise.all(events.map(handleEvent));
+  res.status(200).end();
 }
 
 async function handleEvent(event) {
-  if (event.type !== 'message' || event.message?.type !== 'text') return;
+  if (event.type !== 'message' || event.message.type !== 'text') return;
 
   const text = (event.message.text || '').trim();
   const userId = event.source?.userId || 'anonymous';
 
-  // --- ★ ここがポイント：inputs を「両方のキー」で送る ---
-  // Dify 側が sys.query を読むのか query を読むのか不一致だと 400 になるため、
-  // 一旦どちらも同じテキストを渡して確実に通します。
-  const inputs = {
-    [process.env.DIFY_INPUT_KEY || 'query']: text, // 環境変数優先（なければ query）
-    'query': text,       // 保険その1
-    'sys.query': text    // 保険その2
-  };
-
+  // 🔸ここがポイント：同じテキストを2つのキーで投げる（保険）
   const payload = {
-    inputs,
+    inputs: {
+      'sys.query': text,      // Difyの推奨キー
+      'USER_MESSAGE': text,   // もしワークフローがこの名前を期待していてもOK
+    },
     response_mode: 'blocking',
-    user: userId,              // 会話の識別に使われる
-    // conversation_id: userId  // 必要なら有効化（なくても動きます）
+    user: userId,
+    conversation_id: userId,
   };
 
   try {
-    const dify = await axios.post(
-      process.env.DIFY_WORKFLOW_URL || 'https://api.dify.ai/v1/workflows/run',
+    const r = await axios.post(
+      process.env.DIFY_WORKFLOW_URL, // 例: https://api.dify.ai/v1/workflows/run
       payload,
-      { headers: { Authorization: `Bearer ${process.env.DIFY_API_KEY}` } }
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.DIFY_API_KEY}`, // DIFY_API_KEYは「app-」から始まる生キー
+          'Content-Type': 'application/json',
+        },
+        timeout: 45000,
+      }
     );
 
     const out =
-      dify.data?.data?.outputs?.text ??
-      dify.data?.data?.outputs?.answer ??
-      '(Difyの応答が空でした)';
+      r?.data?.data?.outputs?.text ||
+      r?.data?.data?.outputs?.answer ||
+      r?.data?.answer ||
+      '(Dify応答なし)';
 
     await client.replyMessage(event.replyToken, { type: 'text', text: out });
   } catch (err) {
-    const status = err?.response?.status;
-    const data = err?.response?.data;
-    console.error('Dify error:', status, JSON.stringify(data || err.message));
+    console.error('Dify error', err?.response?.status, err?.response?.data);
+    const msg = err?.response?.data?.message || JSON.stringify(err?.response?.data || {});
     await client.replyMessage(event.replyToken, {
       type: 'text',
-      text: `Difyリクエスト失敗（${status ?? '不明'}）。ログを確認してください。`,
+      text: `Difyリクエスト失敗（${err?.response?.status || '---'}）。${msg}`,
     });
   }
 }
